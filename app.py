@@ -9,10 +9,9 @@ from pydantic import BaseModel, Field, validator
 import morfeusz2
 
 # =========================
-# Konfiguracja CORS
+# CORS
 # =========================
-# Na produkcji podaj konkretne domeny WP i ustaw allow_credentials=True.
-# Na szybkie testy zostaw "*" i credentials=False (ważne: "*" nie działa z credentials=True).
+# Na produkcji podaj konkretne domeny i ustaw allow_credentials=True.
 ALLOWED_ORIGINS = ["*"]
 ALLOW_CREDENTIALS = False
 
@@ -27,12 +26,12 @@ app.add_middleware(
 )
 
 # =========================
-# Morfeusz – jeden globalny obiekt
+# Morfeusz – global
 # =========================
 morf = morfeusz2.Morfeusz()
 
 # =========================
-# Tokenizacja (zachowuje spacje)
+# Pomocnicze
 # =========================
 WORD_RX = re.compile(r"(\s+|[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+|[0-9]+|[^\sA-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9])")
 
@@ -45,6 +44,15 @@ def is_word(t: str) -> bool:
 def stable_seed(*parts: str) -> int:
     h = hashlib.md5(("||".join(parts)).encode("utf-8")).hexdigest()
     return int(h[:16], 16)
+
+def clean_colon_suffix(s: str) -> str:
+    """
+    Usuwa sufiksy typu ':Sm1', ':Sf', ':S' itp. jeśli trafią do formy lub lemy.
+    """
+    if not isinstance(s, str):
+        s = str(s) if s is not None else ""
+    # czasem zdarzają się wielokrotne dwukropki – bierzemy tylko część przed pierwszym
+    return s.split(":", 1)[0]
 
 # =========================
 # Schematy wej./wyj.
@@ -63,7 +71,7 @@ class MixOut(BaseModel):
     result: str
 
 # =========================
-# Morf: parsowanie tagów
+# Morf: tagi i analiza
 # =========================
 def parse_tag(tag: str) -> Dict[str, str]:
     """
@@ -89,7 +97,6 @@ def analyze_token_word(tok: str) -> Tuple[bool, str, str, Dict[str, str]]:
     Odporne na różne długości krotek zwracanych przez Morfeusza.
     """
     analyses = morf.analyse(tok)
-    # 'analyses' to zwykle lista krotek: (start, end, info), gdzie info to tuple >=3
     for a in analyses:
         if len(a) < 3:
             continue
@@ -104,9 +111,12 @@ def analyze_token_word(tok: str) -> Tuple[bool, str, str, Dict[str, str]]:
         if isinstance(tag, bytes):
             tag = tag.decode("utf-8", "ignore")
 
-        if isinstance(tag, str) and tag.startswith("subst") and lemma:
+        # oczyść lemę z sufiksów po dwukropku
+        lemma_clean = clean_colon_suffix(lemma) if lemma else None
+
+        if isinstance(tag, str) and tag.startswith("subst") and lemma_clean:
             feats = parse_tag(tag)
-            return True, lemma, tag, feats
+            return True, lemma_clean, tag, feats
     return False, None, None, {}
 
 def donor_lemmas(text: str) -> List[str]:
@@ -117,21 +127,23 @@ def donor_lemmas(text: str) -> List[str]:
             continue
         is_n, lemma, tag, feats = analyze_token_word(t)
         if is_n and lemma:
-            out.append(lemma)
+            out.append(lemma)  # już oczyszczona w analyze_token_word
     return out
 
 def generate_form(lemma: str, tag: str) -> str:
     """
-    Używamy dokładnie TEGO samego tagu, który miał biorca.
-    morf.generate może zwracać krotki dłuższe niż 3 – bierzemy [0] z pierwszego wyniku.
+    Używamy tego samego tagu, który miał biorca.
+    morf.generate może zwracać krotki dłuższe niż 3 – bierzemy [0] i czyścimy sufiksy.
     """
     variants = morf.generate(lemma, tag)
     if variants:
         v = variants[0]
         if isinstance(v, (list, tuple)) and len(v) > 0:
-            return v[0]  # surface form
-        return str(v)
-    return lemma
+            form_str = clean_colon_suffix(v[0])
+            return form_str
+        return clean_colon_suffix(v)
+    # fallback: zwróć „gołą” lemę bez sufiksów
+    return clean_colon_suffix(lemma)
 
 def match_casing(src: str, dst: str) -> str:
     return dst.capitalize() if src[:1].isupper() else dst
@@ -180,4 +192,3 @@ def mix(payload: MixIn):
         out.append(match_casing(t, new_form))
 
     return {"result": "".join(out)}
-
