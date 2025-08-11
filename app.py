@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field, validator
 import morfeusz2
 
 # --- Konfiguracja CORS (możesz podać swoją domenę WP zamiast "*")
-ALLOWED_ORIGINS = ["*"]
+ALLOWED_ORIGINS = ["https://roberttraczyk.art", 
+    "https://www.roberttraczyk.art.pl"]
 
 app = FastAPI(title="Noun Mixer (PL) API")
 
