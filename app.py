@@ -11,10 +11,11 @@ import morfeusz2
 # =========================
 # CORS
 # =========================
+# Na produkcji podaj konkretne domeny i ustaw allow_credentials=True.
 ALLOWED_ORIGINS = ["*"]
 ALLOW_CREDENTIALS = False
 
-app = FastAPI(title="Noun Mixer (PL) API – safe mode")
+app = FastAPI(title="Noun Mixer (PL) API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,9 +35,6 @@ morf = morfeusz2.Morfeusz()
 # =========================
 WORD_RX = re.compile(r"(\s+|[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+|[0-9]+|[^\sA-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9])")
 
-SAFE_SKIP_WORDS = {"co", "kto", "nic", "niczego", "nikt", "to", "tamto"}
-RISKY_PREPS = {"do", "na", "w", "o", "u", "po", "za"}
-
 def is_whitespace(t: str) -> bool:
     return bool(t) and t.isspace()
 
@@ -48,8 +46,12 @@ def stable_seed(*parts: str) -> int:
     return int(h[:16], 16)
 
 def clean_colon_suffix(s: str) -> str:
+    """
+    Usuwa sufiksy typu ':Sm1', ':Sf', ':S' itp. jeśli trafią do formy lub lemy.
+    """
     if not isinstance(s, str):
         s = str(s) if s is not None else ""
+    # czasem zdarzają się wielokrotne dwukropki – bierzemy tylko część przed pierwszym
     return s.split(":", 1)[0]
 
 # =========================
@@ -58,7 +60,7 @@ def clean_colon_suffix(s: str) -> str:
 class MixIn(BaseModel):
     recipient: str = Field(..., description="Tekst biorcy (do 2000 znaków)")
     donor: str = Field(..., description="Tekst dawcy (do 2000 znaków)")
-    strength: float = Field(1.0, ge=0.0, le=1.0)
+    strength: float = Field(1.0, ge=0.0, le=1.0, description="0..1 – jaki odsetek rzeczowników podmienić")
 
     @validator("recipient", "donor", pre=True)
     def trim_len(cls, v: str) -> str:
@@ -72,6 +74,10 @@ class MixOut(BaseModel):
 # Morf: tagi i analiza
 # =========================
 def parse_tag(tag: str) -> Dict[str, str]:
+    """
+    Tagi Morfeusza: np. 'subst:sg:gen:m2'
+    Wyciągamy kluczowe cechy.
+    """
     if isinstance(tag, bytes):
         tag = tag.decode("utf-8", "ignore")
     parts = str(tag).split(":")
@@ -86,11 +92,16 @@ def parse_tag(tag: str) -> Dict[str, str]:
     return feats
 
 def analyze_token_word(tok: str) -> Tuple[bool, str, str, Dict[str, str]]:
+    """
+    Zwraca (is_noun, lemma, tag_str, feats_dict) dla rzeczownika.
+    Odporne na różne długości krotek zwracanych przez Morfeusza.
+    """
     analyses = morf.analyse(tok)
     for a in analyses:
         if len(a) < 3:
             continue
         info = a[2]
+        # info: (form, lemma, tag, ...) – bierzemy pierwsze trzy, jeśli są
         form  = info[0] if len(info) > 0 else tok
         lemma = info[1] if len(info) > 1 else None
         tag   = info[2] if len(info) > 2 else ""
@@ -100,6 +111,7 @@ def analyze_token_word(tok: str) -> Tuple[bool, str, str, Dict[str, str]]:
         if isinstance(tag, bytes):
             tag = tag.decode("utf-8", "ignore")
 
+        # oczyść lemę z sufiksów po dwukropku
         lemma_clean = clean_colon_suffix(lemma) if lemma else None
 
         if isinstance(tag, str) and tag.startswith("subst") and lemma_clean:
@@ -115,16 +127,22 @@ def donor_lemmas(text: str) -> List[str]:
             continue
         is_n, lemma, tag, feats = analyze_token_word(t)
         if is_n and lemma:
-            out.append(lemma)
+            out.append(lemma)  # już oczyszczona w analyze_token_word
     return out
 
 def generate_form(lemma: str, tag: str) -> str:
+    """
+    Używamy tego samego tagu, który miał biorca.
+    morf.generate może zwracać krotki dłuższe niż 3 – bierzemy [0] i czyścimy sufiksy.
+    """
     variants = morf.generate(lemma, tag)
     if variants:
         v = variants[0]
         if isinstance(v, (list, tuple)) and len(v) > 0:
-            return clean_colon_suffix(v[0])
+            form_str = clean_colon_suffix(v[0])
+            return form_str
         return clean_colon_suffix(v)
+    # fallback: zwróć „gołą” lemę bez sufiksów
     return clean_colon_suffix(lemma)
 
 def match_casing(src: str, dst: str) -> str:
@@ -135,7 +153,7 @@ def match_casing(src: str, dst: str) -> str:
 # =========================
 @app.get("/")
 def root():
-    return {"ok": True, "name": "Noun Mixer (PL) API – safe mode", "version": 1}
+    return {"ok": True, "name": "Noun Mixer (PL) API", "version": 1}
 
 @app.post("/mix", response_model=MixOut)
 def mix(payload: MixIn):
@@ -143,7 +161,7 @@ def mix(payload: MixIn):
     dtxt = payload.donor
     strength = float(payload.strength)
 
-    tokens = WORD_RX.findall(rtxt)
+    tokens = WORD_RX.findall(rtxt)          # zachowujemy spacje/znaki
     donors = donor_lemmas(dtxt)
 
     if not tokens:
@@ -154,29 +172,14 @@ def mix(payload: MixIn):
     rng = random.Random(stable_seed(rtxt, dtxt, f"{strength:.4f}"))
 
     out: List[str] = []
-    for i, t in enumerate(tokens):
+    for t in tokens:
         if not is_word(t):
             out.append(t)
             continue
-
         is_n, lemma_b, tag_b, feats_b = analyze_token_word(t)
-        prev_token = tokens[i - 1].lower() if i > 0 else ""
-
-        # Kryteria "bezpiecznej" zamiany:
         if not is_n:
             out.append(t)
             continue
-        if feats_b.get("case") != "nom":
-            out.append(t)
-            continue
-        if lemma_b.lower() in SAFE_SKIP_WORDS:
-            out.append(t)
-            continue
-        if prev_token in RISKY_PREPS:
-            out.append(t)
-            continue
-
-        # losowanie
         if rng.random() > strength:
             out.append(t)
             continue
